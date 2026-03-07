@@ -2,10 +2,10 @@ services:
   stremio-titulky:
     build: .
     ports:
-      - "3000:3000"
+      - "3007:3007"
     environment:
       - NODE_ENV=production
-      - PORT=3000
+      - PORT=3007
       - R2_ENDPOINT=${R2_ENDPOINT}
       - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
       - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
@@ -13,7 +13,7 @@ services:
       - ADMIN_USERS=${ADMIN_USERS:-David32}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3007/"]
       interval: 30s
       timeout: 5s
       retries: 3
