@@ -504,6 +504,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
     // Build response — max 10
     const configStr = req.params.config;
     const isOmni = !!config.omni;
+    const isNuvio = !!config.nuvio;
 
     // For Omni: sort by priority: cached+match > cached > download+match > download
     if (isOmni) {
@@ -535,6 +536,16 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
           lang: `${icon}${star}${quality}${num}`,
           SubEncoding: 'UTF-8',
           SubFormat: 'vtt',
+        };
+      } else if (isNuvio) {
+        return {
+          // Nuvio treats `lang` strictly as a language code and displays `id`
+          // as the subtitle/release description. Keep those concerns separate.
+          id: buildSubtitleDisplayId(sub),
+          url: `${host}/sub/${configStr}/${sub.id}/${encodeURIComponent(sub.linkFile)}`,
+          lang: normalizeSubtitleLanguage(sub.lang),
+          SubEncoding: 'UTF-8',
+          SubFormat: 'srt',
         };
       } else {
         const label = buildLabel(sub, score, hasReleaseTags);
@@ -575,6 +586,14 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', async (req, res) => {
           SubEncoding: 'UTF-8',
           SubFormat: subFormat,
         });
+      } else if (isNuvio) {
+        subtitles.unshift({
+          id: `${cs.label || cs.filename} [vlastní]`,
+          url: subUrl,
+          lang: normalizeSubtitleLanguage(cs.lang),
+          SubEncoding: 'UTF-8',
+          SubFormat: subFormat,
+        });
       } else {
         subtitles.unshift({
           id: `custom-${cs.key}`,
@@ -612,6 +631,20 @@ function isExactTitleMatch(movieName, subText) {
   }
 
   return false;
+}
+
+function normalizeSubtitleLanguage(lang) {
+  const value = String(lang || '').trim().toLowerCase();
+  if (['cs', 'cz', 'ces', 'cze'].includes(value)) return 'cze';
+  if (['sk', 'slo', 'slk'].includes(value)) return 'slk';
+  return value || 'cze';
+}
+
+function buildSubtitleDisplayId(sub) {
+  const release = String(sub.version || sub.title || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return release ? `${release} [${sub.id}]` : `Titulky.com [${sub.id}]`;
 }
 
 function buildLabel(sub, score, hasReleaseTags) {
@@ -1533,6 +1566,14 @@ function getConfigurePage(host) {
     </div>
   </div>
 
+  <div class="nuvio-section" style="margin-top: 14px;">
+    <label class="toggle-row" style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin-bottom: 0;">
+      <input type="checkbox" id="nuvioToggle" onchange="toggleNuvio()" style="width: auto; accent-color: var(--accent); transform: scale(1.2);">
+      <span style="font-size: 14px; color: var(--text);">Optimalizace pro Nuvio / NuvioTV</span>
+    </label>
+    <p style="font-size: 11px; color: var(--text-dim); margin: 7px 0 0 28px;">Správné rozpoznání jazyka a zobrazení názvu releasu v NuvioTV.</p>
+  </div>
+
   <button class="btn btn-primary" id="verifyBtn" onclick="verify()">
     <span class="spinner" id="spinner"></span>
     <span id="btnText">Ověřit a nainstalovat</span>
@@ -1566,13 +1607,23 @@ const HOST = '${host}';
 
 function toggleOmni() {
   const checked = document.getElementById('omniToggle').checked;
+  if (checked) document.getElementById('nuvioToggle').checked = false;
   document.getElementById('rdSection').style.display = checked ? 'block' : 'none';
+}
+
+function toggleNuvio() {
+  const checked = document.getElementById('nuvioToggle').checked;
+  if (checked && document.getElementById('omniToggle').checked) {
+    document.getElementById('omniToggle').checked = false;
+    toggleOmni();
+  }
 }
 
 async function verify() {
   const username = document.getElementById('username').value.trim();
   const password = document.getElementById('password').value.trim();
   const omni = document.getElementById('omniToggle').checked;
+  const nuvio = document.getElementById('nuvioToggle').checked;
   const rdToken = document.getElementById('rdToken').value.trim();
   const status = document.getElementById('status');
   const result = document.getElementById('result');
@@ -1607,6 +1658,7 @@ async function verify() {
 
       const configObj = { username, password };
       if (omni) configObj.omni = true;
+      if (nuvio) configObj.nuvio = true;
       if (omni && rdToken) configObj.rdToken = rdToken;
 
       const config = btoa(JSON.stringify(configObj))
@@ -1662,6 +1714,10 @@ document.getElementById('password').addEventListener('keydown', e => {
       if (parsed.omni) {
         document.getElementById('omniToggle').checked = true;
         toggleOmni();
+      }
+      if (parsed.nuvio) {
+        document.getElementById('nuvioToggle').checked = true;
+        toggleNuvio();
       }
       if (parsed.rdToken) {
         document.getElementById('rdToken').value = parsed.rdToken;
