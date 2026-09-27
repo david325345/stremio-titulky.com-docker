@@ -6,14 +6,17 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3007
+      # Povinné: tajný klíč pro šifrování configu v URL addonu (min. 32 znaků, NEMĚNIT – změna = všichni přeinstalují)
+      - CONFIG_SECRET=${CONFIG_SECRET}
+      # Uživatelská jména z Titulky.com s právy admina (čárkou oddělená)
+      - ADMIN_USERS=${ADMIN_USERS}
       - R2_ENDPOINT=${R2_ENDPOINT}
       - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
       - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
       - R2_BUCKET=${R2_BUCKET}
-      - ADMIN_USERS=${ADMIN_USERS:-David32}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3007/"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3007/health"]
       interval: 30s
       timeout: 5s
       retries: 3
