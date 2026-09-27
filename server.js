@@ -48,12 +48,59 @@ function parseVideoId(type, id) {
 
 // ── Logování bez hesel a configů ─────────────────────────────────
 
+// Pozn.: zástupné texty v [hranatých] závorkách – Coolify zobrazuje log jako HTML a <…> by zmizelo
 function redactPath(p) {
-  return p.replace(/\/v2[A-Za-z0-9_-]{20,}/g, '/<config>').replace(/^\/[A-Za-z0-9_=-]{60,}(?=\/)/, '/<starý-config>');
+  return p.replace(/\/v2[A-Za-z0-9_-]{20,}/g, '/[config]').replace(/^\/[A-Za-z0-9_=-]{60,}(?=\/)/, '/[starý-config]');
+}
+
+function safeDecode(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
+// Podrobný log požadavků z přehrávačů (manifest, titulky, stažení).
+// LOG_REQUESTS=basic → jen jeden řádek na požadavek.
+const LOG_FULL = process.env.LOG_REQUESTS !== 'basic';
+const HIDDEN_HEADERS = new Set(['cookie', 'authorization', 'proxy-authorization']);
+const PLAYER_PATH = /(\/manifest\.json$|\/subtitles\/|^\/sub\/)/;
+// Hlavičky, podle kterých jde poznat přehrávač
+const DETECT_HEADERS = [
+  'user-agent', 'origin', 'referer', 'x-requested-with', 'sec-ch-ua', 'sec-ch-ua-platform',
+  'sec-ch-ua-mobile', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'accept', 'accept-language',
+];
+
+function detectHeadersForLog(headers) {
+  const out = {};
+  for (const h of DETECT_HEADERS) out[h] = headers[h] ? String(headers[h]).slice(0, 300) : '—';
+  return out;
+}
+
+function headersForLog(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k] = HIDDEN_HEADERS.has(k) ? '[skryto]' : String(v).slice(0, 300);
+  }
+  return out;
 }
 
 app.use((req, res, next) => {
-  if (req.path !== '/health') console.log(`[REQ] ${req.method} ${redactPath(req.path)}`);
+  if (req.path === '/health') return next();
+  const start = Date.now();
+  const path = redactPath(safeDecode(req.path));
+  console.log(`[REQ] ${req.method} ${path}`);
+
+  if (LOG_FULL && PLAYER_PATH.test(req.path)) {
+    const lines = [`      ip: ${req.ip}`];
+    if (Object.keys(req.query).length) lines.push(`      query: ${JSON.stringify(req.query)}`);
+    // Extra parametry Stremia (filename, videoSize, videoHash…) z posledního segmentu cesty
+    const m = req.path.match(/\/subtitles\/[^/]+\/[^/]+\/([^/]+)\.json$/);
+    if (m) lines.push(`      extra: ${JSON.stringify(Object.fromEntries(new URLSearchParams(safeDecode(m[1]))))}`);
+    lines.push(`      přehrávač: ${JSON.stringify(detectHeadersForLog(req.headers))}`);
+    lines.push(`      všechny hlavičky: ${JSON.stringify(headersForLog(req.headers))}`);
+    console.log(lines.join('\n'));
+    res.on('finish', () => {
+      console.log(`[RES] ${res.statusCode} ${path} (${Date.now() - start} ms, ${res.getHeader('content-length') || '?'} B)`);
+    });
+  }
   next();
 });
 
@@ -201,7 +248,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const vid = parseVideoId(type, id);
   if (!vid) return res.json({ subtitles: [] });
 
-  const profile = detectProfile(req, config);
+  const { profile, how: profileHow } = detectProfile(req, config);
   const host = hostOf(req);
   const configStr = req.params.config;
   const ep = type === 'series' ? match.episodeCode(vid.season, vid.episode) : null;
@@ -225,7 +272,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   rows = await finder.verifyCandidates(rows, vid.imdbId, MAX_RESULTS);
   rows = rankRows(rows, playTags);
 
-  console.log(`[Addon] ${type} ${id} "${name}" | profil ${profile} | soubor: ${playing ? 'ano' : 'ne'} | výsledků ${rows.length}/${candidates.length}`);
+  console.log(`[Addon] ${type} ${id} "${name}" | profil ${profile} (${profileHow}) | soubor: ${playing ? 'ano' : 'ne'} | výsledků ${rows.length}/${candidates.length}`);
 
   r2.addToHistory(config.u, { imdbId: vid.imdbId, type, id, name, poster: meta.poster || null, time: Date.now() });
 
