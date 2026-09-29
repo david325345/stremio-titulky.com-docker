@@ -21,7 +21,7 @@ r2.loadCacheIndex();
 const app = express();
 const PORT = process.env.PORT || 3007;
 const MAX_RESULTS = 10;
-const VERSION = '2.0.0';
+const VERSION = '2.0.2';
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -226,6 +226,47 @@ function normalizeLang(lang) {
   return v || 'cze';
 }
 
+// ── Popisky titulků ─────────────────────────────────────────────
+
+// Bez délky filmu: „… (02:56:11, 02:56:12)" a useknuté „(02:5…" pryč
+function cleanLabel(s) {
+  return String(s || '')
+    .replace(/\(\s*\d{1,2}:\d{2}(:\d{2})?[^)]*\)?/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[\s/,;-]+$/, '')
+    .trim();
+}
+
+const NUVIO_MAX = 25; // Nuvio menu zahodí delší popisek (sanitizeSubtitleLabel)
+const SERVICES = { amzn: 'AMZN', hmax: 'HMAX', max: 'MAX', nf: 'NF', it: 'iT', ma: 'MA', dsnp: 'DSNP', atvp: 'ATVP',
+  hulu: 'HULU', pcok: 'PCOK', skst: 'SKST', cr: 'CR', pmtp: 'PMTP', stan: 'STAN', vyre: 'VYRE' };
+const SOURCE_NAME = { remux: 'Remux', bluray: 'BluRay', hddvd: 'HD-DVD', webdl: 'WEB-DL', webrip: 'WEBRip',
+  web: 'WEB', hdtv: 'HDTV', dvd: 'DVD', hdrip: 'HDRip', cam: 'CAM' };
+
+// Jen „kvalita": [služba] + zdroj, z první varianty releasu („AMZN.WEB-DL / WEB-DL" → „AMZN WEB-DL")
+function qualityText(label) {
+  const first = label.split(/\s+\/\s+/)[0] || label;
+  for (const part of [first, label]) {
+    const t = match.extractTags(part);
+    if (!t.source) continue;
+    const svc = (part.match(/(?:^|[\s._\-[(])(AMZN|HMAX|MAX|NF|iT|MA|DSNP|ATVP|HULU|PCOK|SKST|CR|PMTP|STAN|VYRE)(?=[\s._\-\])])/) || [])[1];
+    const src = SOURCE_NAME[t.source];
+    const svcName = svc ? SERVICES[svc.toLowerCase()] : null;
+    return svcName && t.source !== 'bluray' && t.source !== 'remux' ? `${svcName} ${src}` : src;
+  }
+  return '';
+}
+
+function fitNuvio(text) {
+  const chars = [...text];
+  return chars.length <= NUVIO_MAX ? text : chars.slice(0, NUVIO_MAX - 1).join('').trimEnd() + '…';
+}
+
+function nuvioLabel(icon, star, label) {
+  const q = qualityText(label) || label.replace(/[._]+/g, ' ') || 'Titulky.com';
+  return fitNuvio(`${icon} ${star ? star + ' ' : ''}${q}`);
+}
+
 function isRowCached(row, ep) {
   return (ep && r2.isCached(`${row.id}-${ep}`)) || r2.isCached(row.id);
 }
@@ -248,6 +289,34 @@ function rankRows(rows, playTags, ep) {
       (b.downloads || 0) - (a.downloads || 0));
 }
 
+// ── Nuvio: obejití zahazování druhé odpovědi (mergeExternalSubtitles) ─────
+// Nuvio se ptá 1) při načítání streamů bez názvu souboru, 2) z přehrávače s názvem
+// souboru. Z 2) převezme jen titulky s NOVOU URL, takže popisky s ⭐/🎯 se ztratí.
+// Proto na PRVNÍ dotaz bez souboru (config + IP + video, 30 min) vrátíme prázdno.
+// Po dotazu s názvem souboru se značka smaže (příště zase prázdno → zase ⭐).
+// Vypnutí: NUVIO_EMPTY_FIRST=0 (až Nuvio opraví mergeExternalSubtitles).
+const NUVIO_EMPTY_FIRST = process.env.NUVIO_EMPTY_FIRST !== '0';
+const NUVIO_FIRST_TTL = 30 * 60 * 1000;
+const nuvioFirstSeen = new Map();
+
+function nuvioSkipFirst(req, configStr, videoId, extra) {
+  if (!NUVIO_EMPTY_FIRST) return false;
+  const key = `${require('crypto').createHash('sha256').update(String(configStr)).digest('hex').slice(0, 16)}|${req.ip}|${videoId}`;
+  const now = Date.now();
+  if (nuvioFirstSeen.size > 5000) {
+    for (const [k, t] of nuvioFirstSeen) if (now - t > NUVIO_FIRST_TTL) nuvioFirstSeen.delete(k);
+  }
+  const hasFile = !!(extra.get('filename') || extra.get('videoSize') || extra.get('videoHash'));
+  if (hasFile) {                     // dotaz z přehrávače s názvem souboru → relace hotová
+    nuvioFirstSeen.delete(key);
+    return false;
+  }
+  const t = nuvioFirstSeen.get(key);
+  if (t && now - t < NUVIO_FIRST_TTL) return false; // druhý dotaz bez souboru → normální odpověď
+  nuvioFirstSeen.set(key, now);
+  return true;
+}
+
 app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const config = getConfig(req);
   const { type } = req.params;
@@ -261,12 +330,23 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const configStr = req.params.config;
   const ep = type === 'series' ? match.episodeCode(vid.season, vid.episode) : null;
 
+  const extra = new URLSearchParams(req.params.extra || '');
+
+  // Nuvio: první dotaz bez názvu souboru (při načítání streamů) → prázdný seznam.
+  // Nuvio pak odpověď z přehrávače (už s názvem souboru, s ⭐/🎯) nezahodí jako duplicitu.
+  if (profile === 'nuvio' && nuvioSkipFirst(req, configStr, id, extra)) {
+    console.log(`[Addon] ${type} ${id} | profil nuvio | první dotaz bez souboru → prázdný seznam (titulky pošlu přehrávači)`);
+    getMeta(type, vid.imdbId) // předehřát cache, ať je odpověď přehrávači rychlá
+      .then(m => m && finder.findCandidates({ type, meta: m, season: vid.season, episode: vid.episode }))
+      .catch(() => {});
+    return res.json({ subtitles: [] });
+  }
+
   const meta = await getMeta(type, vid.imdbId);
   if (!meta) return res.json({ subtitles: [] });
   const name = meta.name || '';
 
   // Název přehrávaného souboru (Stremio ho posílá v extra)
-  const extra = new URLSearchParams(req.params.extra || '');
   let playing = (extra.get('filename') || '').trim();
   if (!match.hasUsefulTags(match.extractTags(playing)) && config.rd) {
     const fn = await rdFilename(config.rd, name, vid.season, vid.episode);
@@ -291,7 +371,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const subtitles = rows.map(row => {
     const icon = row.cached ? '✅' : '⬇️';
     const star = row.level === 2 ? '🎯' : row.level === 1 ? '⭐' : '';
-    const label = (row.release || row.detail?.versionFor || row.title || '').replace(/\s+/g, ' ').trim();
+    const label = cleanLabel(row.release || row.detail?.versionFor || row.title || '');
     const url = `${host}/sub/${configStr}/${row.id}/${fmt}/${epTok}/${encodeURIComponent(row.linkFile)}.${fmt}`;
     const lang = normalizeLang(row.lang);
 
@@ -303,8 +383,10 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
     }
     if (profile === 'nuvio') {
       // Nuvio bere `lang` jako kód jazyka a `id` zobrazuje jako popis
+      // Nuvio: popisek jen z `id`, karta ho zkrátí na 1 řádek a menu ho nad 25 znaků
+      // zahodí → jen ikona + hvězda + kvalita (bez rozlišení a skupiny)
       return {
-        id: `${icon} ${star ? star + ' ' : ''}${label || 'Titulky.com'} [${row.id}]`,
+        id: nuvioLabel(icon, star, label),
         url, lang, SubEncoding: 'UTF-8', SubFormat: 'srt',
       };
     }
@@ -338,7 +420,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
       omniCounters['📌'] = (omniCounters['📌'] || 0) + 1;
       subtitles.unshift({ id: `custom-${cs.key}`, url, lang: `📌${numberEmoji(omniCounters['📌'])}`, SubEncoding: 'UTF-8', SubFormat: subFormat });
     } else if (profile === 'nuvio') {
-      subtitles.unshift({ id: `📌 ${cs.label || cs.filename} [vlastní]`, url, lang, SubEncoding: 'UTF-8', SubFormat: subFormat });
+      subtitles.unshift({ id: fitNuvio(`📌 ${cs.label || cs.filename}`), url, lang, SubEncoding: 'UTF-8', SubFormat: subFormat });
     } else {
       subtitles.unshift({ id: `custom-${cs.key}`, url, lang: `📌 ${FLAG[lang] || ''} ${cs.label}`.replace(/\s+/g, ' ').trim(), SubEncoding: 'UTF-8', SubFormat: subFormat });
     }
