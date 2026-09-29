@@ -226,16 +226,22 @@ function normalizeLang(lang) {
   return v || 'cze';
 }
 
-function rankRows(rows, playTags) {
+function isRowCached(row, ep) {
+  return (ep && r2.isCached(`${row.id}-${ep}`)) || r2.isCached(row.id);
+}
+
+// Pořadí: titulky už v cache (R2, ✅) první → shoda s přehrávaným souborem → kvalita → počet stažení
+function rankRows(rows, playTags, ep) {
   const hasPlay = match.hasUsefulTags(playTags);
   return rows
     .map(row => {
       const strings = [row.release, row.detail?.versionFor, row.title];
       const ml = hasPlay ? match.matchLevel(strings, playTags) : { level: 0, score: 0 };
       const quality = match.qualityScore(row.release || row.detail?.versionFor || row.title || '');
-      return { ...row, level: ml.level, score: ml.score, quality };
+      return { ...row, cached: !!isRowCached(row, ep), level: ml.level, score: ml.score, quality };
     })
     .sort((a, b) =>
+      (b.cached ? 1 : 0) - (a.cached ? 1 : 0) ||
       b.level - a.level ||
       b.score - a.score ||
       b.quality - a.quality ||
@@ -270,9 +276,9 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
 
   // Hledání → řazení → ověření IMDb u nejlepších → přeřazení (s „Verze pro“ z detailu)
   const candidates = await finder.findCandidates({ type, meta, season: vid.season, episode: vid.episode });
-  let rows = rankRows(candidates, playTags);
+  let rows = rankRows(candidates, playTags, ep);
   rows = await finder.verifyCandidates(rows, vid.imdbId, MAX_RESULTS);
-  rows = rankRows(rows, playTags);
+  rows = rankRows(rows, playTags, ep);
 
   console.log(`[Addon] ${type} ${id} "${name}" | profil ${profile} (${profileHow}) | soubor: ${playing ? 'ano' : 'ne'} | výsledků ${rows.length}/${candidates.length}`);
 
@@ -283,8 +289,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const omniCounters = {};
 
   const subtitles = rows.map(row => {
-    const cached = (ep && r2.isCached(`${row.id}-${ep}`)) || r2.isCached(row.id);
-    const icon = cached ? '✅' : '⬇️';
+    const icon = row.cached ? '✅' : '⬇️';
     const star = row.level === 2 ? '🎯' : row.level === 1 ? '⭐' : '';
     const label = (row.release || row.detail?.versionFor || row.title || '').replace(/\s+/g, ' ').trim();
     const url = `${host}/sub/${configStr}/${row.id}/${fmt}/${epTok}/${encodeURIComponent(row.linkFile)}.${fmt}`;
@@ -409,13 +414,38 @@ function contentDisposition(filename) {
   return `inline; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }
 
-function sendSubtitle(res, srt, filename, fmt, { error = false } = {}) {
+// Odeslání s podporou HTTP Range (přehrávače Applu – NuvioTV/AVFoundation – se ptají
+// po částech: bytes=0-1, bytes=0-…, HEAD). Jeden rozsah; víc rozsahů → celý soubor.
+function sendRanged(req, res, body) {
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+  const total = buf.length;
+  res.setHeader('Accept-Ranges', 'bytes');
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || '').trim());
+  if (!m || (m[1] === '' && m[2] === '')) return res.send(buf);
+  let start;
+  let end;
+  if (m[1] === '') {                       // bytes=-N → posledních N bajtů
+    start = Math.max(0, total - Number(m[2]));
+    end = total - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] === '' ? total - 1 : Math.min(Number(m[2]), total - 1);
+  }
+  if (!total || start >= total || start > end) {
+    res.setHeader('Content-Range', `bytes */${total}`);
+    return res.status(416).end();
+  }
+  res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+  return res.status(206).send(buf.subarray(start, end + 1));
+}
+
+function sendSubtitle(req, res, srt, filename, fmt, { error = false } = {}) {
   const body = fmt === 'vtt' ? conv.srtToVtt(srt) : srt;
   const name = filename.replace(/\.srt$/i, '') + (fmt === 'vtt' ? '.vtt' : '.srt');
   res.setHeader('Content-Type', `${fmt === 'vtt' ? 'text/vtt' : 'text/plain'}; charset=utf-8`);
   res.setHeader('Content-Disposition', contentDisposition(name));
   res.setHeader('Cache-Control', error ? 'no-store' : 'public, max-age=86400');
-  res.send(body);
+  sendRanged(req, res, body);
 }
 
 app.get('/sub/:config/:subId/:fmt/:ep/:file', ah(async (req, res) => {
@@ -436,9 +466,9 @@ app.get('/sub/:config/:subId/:fmt/:ep/:file', ah(async (req, res) => {
   const out = await p;
   if (out.error) {
     console.log(`[Addon] Stažení ${subId} selhalo: ${out.error}`);
-    return sendSubtitle(res, conv.messageSrt(ERROR_TEXT[out.error] || ERROR_TEXT.error), 'titulky-chyba.srt', fmt, { error: true });
+    return sendSubtitle(req, res, conv.messageSrt(ERROR_TEXT[out.error] || ERROR_TEXT.error), 'titulky-chyba.srt', fmt, { error: true });
   }
-  sendSubtitle(res, out.content, out.filename, fmt);
+  sendSubtitle(req, res, out.content, out.filename, fmt);
 }));
 
 // ── Vlastní titulky: servírování ─────────────────────────────────
@@ -465,7 +495,7 @@ app.get('/custom-sub/:videoId/:filename', ah(async (req, res) => {
   else { body = conv.toSrt(text); ct = 'text/plain'; }
   res.setHeader('Content-Type', `${ct}; charset=utf-8`);
   res.setHeader('Content-Disposition', contentDisposition(filename));
-  res.send(body);
+  sendRanged(req, res, body);
 }));
 
 app.get('/custom-sub-raw/:videoId/:filename', ah(async (req, res) => {
@@ -473,7 +503,7 @@ app.get('/custom-sub-raw/:videoId/:filename', ah(async (req, res) => {
   if (!o) return;
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Content-Disposition', contentDisposition(req.params.filename));
-  res.send(conv.toUtf8String(o.body));
+  sendRanged(req, res, conv.toUtf8String(o.body));
 }));
 
 // ── Dashboard a vlastní titulky: správa ──────────────────────────
