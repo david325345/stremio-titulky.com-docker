@@ -12,7 +12,7 @@ const { TitulkyClient } = require('./lib/titulkyClient');
 const finder = require('./lib/finder');
 const match = require('./lib/matching');
 const conv = require('./lib/convert');
-const { detectProfile, listSeen, PROFILES } = require('./lib/clientDetect');
+const { detectProfile, noteManifest, listSeen, PROFILES } = require('./lib/clientDetect');
 const pages = require('./lib/pages');
 
 auth.init();
@@ -208,7 +208,9 @@ function manifest(configured) {
 app.get('/manifest.json', (req, res) => res.json(manifest(false)));
 app.get('/:config/manifest.json', (req, res) => {
   // Starý nebo neplatný config → Stremio vyzve ke konfiguraci
-  res.json(manifest(!!getConfig(req)));
+  const valid = !!getConfig(req);
+  if (valid) noteManifest(req, req.params.config);
+  res.json(manifest(valid));
 });
 
 // ── Hledání titulků ──────────────────────────────────────────────
@@ -248,7 +250,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const vid = parseVideoId(type, id);
   if (!vid) return res.json({ subtitles: [] });
 
-  const { profile, how: profileHow } = detectProfile(req, config);
+  const { profile, how: profileHow } = detectProfile(req, config, req.params.config);
   const host = hostOf(req);
   const configStr = req.params.config;
   const ep = type === 'series' ? match.episodeCode(vid.season, vid.episode) : null;
