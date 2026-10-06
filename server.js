@@ -21,7 +21,7 @@ r2.loadCacheIndex();
 const app = express();
 const PORT = process.env.PORT || 3007;
 const MAX_RESULTS = 10;
-const VERSION = '2.0.3';
+const VERSION = '2.0.4';
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -237,34 +237,27 @@ function cleanLabel(s) {
     .trim();
 }
 
-const NUVIO_MAX = 25; // Nuvio menu zahodí delší popisek (sanitizeSubtitleLabel)
-const SERVICES = { amzn: 'AMZN', hmax: 'HMAX', max: 'MAX', nf: 'NF', it: 'iT', ma: 'MA', dsnp: 'DSNP', atvp: 'ATVP',
-  hulu: 'HULU', pcok: 'PCOK', skst: 'SKST', cr: 'CR', pmtp: 'PMTP', stan: 'STAN', vyre: 'VYRE' };
-const SOURCE_NAME = { remux: 'Remux', bluray: 'BluRay', hddvd: 'HD-DVD', webdl: 'WEB-DL', webrip: 'WEBRip',
-  web: 'WEB', hdtv: 'HDTV', dvd: 'DVD', hdrip: 'HDRip', cam: 'CAM' };
-
-// Jen „kvalita": [služba] + zdroj, z první varianty releasu („AMZN.WEB-DL / WEB-DL" → „AMZN WEB-DL")
-function qualityText(label) {
-  const first = label.split(/\s+\/\s+/)[0] || label;
-  for (const part of [first, label]) {
-    const t = match.extractTags(part);
-    if (!t.source) continue;
-    const svc = (part.match(/(?:^|[\s._\-[(])(AMZN|HMAX|MAX|NF|iT|MA|DSNP|ATVP|HULU|PCOK|SKST|CR|PMTP|STAN|VYRE)(?=[\s._\-\])])/) || [])[1];
-    const src = SOURCE_NAME[t.source];
-    const svcName = svc ? SERVICES[svc.toLowerCase()] : null;
-    return svcName && t.source !== 'bluray' && t.source !== 'remux' ? `${svcName} ${src}` : src;
-  }
-  return '';
-}
+// Nuvio 3.4.1: popisek na kartě až na 2 řádky (~75 znaků), menu ho už nezahazuje
+const NUVIO_MAX = 75;
 
 function fitNuvio(text) {
   const chars = [...text];
   return chars.length <= NUVIO_MAX ? text : chars.slice(0, NUVIO_MAX - 1).join('').trimEnd() + '…';
 }
 
+// Celý název releasu; tečky a podtržítka → mezery (kvůli zalamování v Nuviu)
 function nuvioLabel(icon, star, label) {
-  const q = qualityText(label) || label.replace(/[._]+/g, ' ') || 'Titulky.com';
-  return fitNuvio(`${icon} ${star ? star + ' ' : ''}${q}`);
+  const text = label
+    .replace(/_+/g, ' ')
+    // tečka zůstane jen v desetinném čísle (5.1, 7.1, 23.976), ne v „2022.1080p" ani „x265.10bit"
+    .replace(/\./g, (m, i, str) => {
+      const left = str.slice(0, i);
+      const keep = /(^|\D)\d{1,2}$/.test(left) && !/\d\.\d{1,2}$/.test(left) && /^\d{1,3}(?![\dpi])/i.test(str.slice(i + 1));
+      return keep ? '.' : ' ';
+    })
+    .replace(/\s+/g, ' ')
+    .trim() || 'Titulky.com';
+  return fitNuvio(`${icon} ${star ? star + ' ' : ''}${text}`);
 }
 
 function isRowCached(row, ep) {
@@ -383,8 +376,7 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
     }
     if (profile === 'nuvio') {
       // Nuvio bere `lang` jako kód jazyka a `id` zobrazuje jako popis
-      // Nuvio: popisek jen z `id`, karta ho zkrátí na 1 řádek a menu ho nad 25 znaků
-      // zahodí → jen ikona + hvězda + kvalita (bez rozlišení a skupiny)
+      // Nuvio: popisek z `id` – ikona, hvězda a celý název releasu (max 75 znaků)
       return {
         id: nuvioLabel(icon, star, label),
         url, lang, SubEncoding: 'UTF-8', SubFormat: 'srt',
