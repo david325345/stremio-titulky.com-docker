@@ -21,7 +21,7 @@ r2.loadCacheIndex();
 const app = express();
 const PORT = process.env.PORT || 3007;
 const MAX_RESULTS = 10;
-const VERSION = '2.0.2';
+const VERSION = '2.0.3';
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
