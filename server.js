@@ -245,7 +245,7 @@ app.get('/:config/manifest.json', (req, res) => {
   res.json(manifest(!!config, config));
 });
 
-// ── Katalog „Nejnovější titulky" (aktualizace 6:00 a 12:00, uložený na R2) ──
+// ── Katalog „Nejnovější titulky" (aktualizace 12:00 a 18:00, uložený na R2) ──
 app.get('/:config/catalog/:type/:id/:extra?.json', (req, res) => {
   const config = getConfig(req);
   if (!config || !catalogOn(config) || req.params.id !== CATALOG_ID) return res.json({ metas: [] });
