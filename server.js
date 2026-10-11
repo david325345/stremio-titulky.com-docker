@@ -15,6 +15,7 @@ const conv = require('./lib/convert');
 const { detectProfile, noteManifest, listSeen, PROFILES } = require('./lib/clientDetect');
 const pages = require('./lib/pages');
 const premium = require('./lib/premium');
+const catalog = require('./lib/catalog');
 
 // Zdroj titulků: premium.titulky.com (hledání podle IMDb, jen pro VIP) nebo původní www (classic)
 const MODE = process.env.TITULKY_MODE === 'classic' ? 'classic' : 'premium';
@@ -216,14 +217,19 @@ app.get('/:config/configure', (req, res) => res.type('html').send(pages.configur
 
 // ── Manifest ─────────────────────────────────────────────────────
 
-function manifest(configured) {
+const CATALOG_ID = 'titulky-nejnovejsi';
+const catalogOn = config => !!config && config.k !== 0; // starší instalace bez volby = zapnuto
+
+function manifest(configured, config = null) {
+  const withCatalog = configured && catalogOn(config);
   return {
     id: 'community.titulky.com',
     version: VERSION,
     name: 'Titulky.com',
     description: 'České a slovenské titulky z Titulky.com',
-    catalogs: [],
-    resources: ['subtitles'],
+    // Jeden katalog s filmy i seriály – každá položka má vlastní typ
+    catalogs: withCatalog ? [{ type: 'movie', id: CATALOG_ID, name: 'Nejnovější titulky' }] : [],
+    resources: withCatalog ? ['subtitles', 'catalog'] : ['subtitles'],
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
     logo: 'https://raw.githubusercontent.com/david325345/stremio-titulky.com/main/public/logo.png',
@@ -234,9 +240,19 @@ function manifest(configured) {
 app.get('/manifest.json', (req, res) => res.json(manifest(false)));
 app.get('/:config/manifest.json', (req, res) => {
   // Starý nebo neplatný config → Stremio vyzve ke konfiguraci
-  const valid = !!getConfig(req);
-  if (valid) noteManifest(req, req.params.config);
-  res.json(manifest(valid));
+  const config = getConfig(req);
+  if (config) noteManifest(req, req.params.config);
+  res.json(manifest(!!config, config));
+});
+
+// ── Katalog „Nejnovější titulky" (aktualizace 6:00 a 12:00, uložený na R2) ──
+app.get('/:config/catalog/:type/:id/:extra?.json', (req, res) => {
+  const config = getConfig(req);
+  if (!config || !catalogOn(config) || req.params.id !== CATALOG_ID) return res.json({ metas: [] });
+  const extra = new URLSearchParams(req.params.extra || '');
+  const skip = parseInt(extra.get('skip') || '0', 10) || 0;
+  res.setHeader('Cache-Control', 'public, max-age=1800');
+  res.json({ metas: skip > 0 ? [] : catalog.getMetas() });
 });
 
 // ── Hledání titulků ──────────────────────────────────────────────
@@ -842,7 +858,7 @@ function verifyRateLimited(ip) {
 
 app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
   if (verifyRateLimited(req.ip)) return res.status(429).json({ success: false, error: 'rate' });
-  const { username, password, client, rdToken } = req.body || {};
+  const { username, password, client, rdToken, catalog: wantCatalog } = req.body || {};
   if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password
       || username.length > 100 || password.length > 200) {
     return res.json({ success: false, error: 'missing_credentials' });
@@ -875,6 +891,7 @@ app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
 
   const cfg = { u, p: password, c: PROFILES.includes(client) ? client : 'auto' };
   if (typeof rdToken === 'string' && /^[A-Za-z0-9]{20,100}$/.test(rdToken.trim())) cfg.rd = rdToken.trim();
+  if (wantCatalog === false) cfg.k = 0;
   res.json({ success: true, config: auth.encryptConfig(cfg), user: u, validUntil: vipUntil ? new Date(vipUntil).toISOString() : null });
 }));
 
@@ -891,6 +908,7 @@ process.on('unhandledRejection', e => console.error('[Chyba] Neošetřený promi
 
 const server = app.listen(PORT, () => {
   console.log(`Titulky.com addon ${VERSION} běží na portu ${PORT} – konfigurace: /configure`);
+  catalog.start().catch(e => console.log(`[Katalog] Start selhal: ${e.message}`));
 });
 
 async function shutdown(sig) {
