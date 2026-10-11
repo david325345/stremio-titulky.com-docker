@@ -232,7 +232,7 @@ function manifest(configured, config = null) {
     resources: withCatalog ? ['subtitles', 'catalog'] : ['subtitles'],
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
-    logo: 'https://raw.githubusercontent.com/david325345/stremio-titulky.com/main/public/logo.png',
+    logo: 'https://raw.githubusercontent.com/david325345/stremio-titulky.com-docker/main/public/logo.png',
     behaviorHints: { configurable: true, configurationRequired: !configured },
   };
 }
