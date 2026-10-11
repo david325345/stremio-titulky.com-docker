@@ -19,12 +19,15 @@ const premium = require('./lib/premium');
 // Zdroj titulků: premium.titulky.com (hledání podle IMDb, jen pro VIP) nebo původní www (classic)
 const MODE = process.env.TITULKY_MODE === 'classic' ? 'classic' : 'premium';
 
+// Dashboard + vlastní (nahrané) titulky + admin záloha: zakonzervováno, zapnutí DASHBOARD=1
+const DASHBOARD = process.env.DASHBOARD === '1';
+
 auth.init();
 r2.loadCacheIndex();
 
 const app = express();
 const PORT = process.env.PORT || 3007;
-const MAX_RESULTS = 10;
+const MAX_RESULTS = 20;
 const VERSION = '2.1.0';
 
 app.set('trust proxy', 1);
@@ -116,6 +119,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// Vypnutý dashboard → jeho stránky a API (vlastní titulky, nahrávání, admin) jako by neexistovaly
+const RE_DASHBOARD_PATH = /^\/(?:[^/]+\/(?:dashboard|custom-list|upload|custom-delete|admin)(?:\/|$)|custom-sub(?:-raw)?\/)/;
+app.use((req, res, next) => {
+  if (!DASHBOARD && RE_DASHBOARD_PATH.test(req.path)) return res.status(404).send('Nenalezeno');
+  next();
+});
+
 function hostOf(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
@@ -201,8 +211,8 @@ async function rdFilename(token, name, season, episode) {
 
 app.get('/health', (req, res) => res.json({ ok: true, version: VERSION }));
 app.get('/', (req, res) => res.redirect('/configure'));
-app.get('/configure', (req, res) => res.type('html').send(pages.configurePage()));
-app.get('/:config/configure', (req, res) => res.type('html').send(pages.configurePage()));
+app.get('/configure', (req, res) => res.type('html').send(pages.configurePage({ dashboard: DASHBOARD })));
+app.get('/:config/configure', (req, res) => res.type('html').send(pages.configurePage({ dashboard: DASHBOARD })));
 
 // ── Manifest ─────────────────────────────────────────────────────
 
@@ -479,9 +489,9 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
 
   if (noticeItem) subtitles.unshift(noticeItem);
 
-  // Vlastní (nahrané) titulky nahoru
+  // Vlastní (nahrané) titulky nahoru – jen se zapnutým dashboardem
   const customId = type === 'series' ? id.replace(/:/g, '-') : vid.imdbId;
-  const customSubs = await r2.listCustomSubs(customId);
+  const customSubs = DASHBOARD ? await r2.listCustomSubs(customId) : [];
   for (const cs of customSubs.slice().reverse()) {
     const ext = cs.filename.split('.').pop().toLowerCase();
     const isAss = ext === 'ass' || ext === 'ssa';
@@ -839,6 +849,7 @@ app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
   }
   const u = username.trim();
   let ok = false;
+  let vipUntil = null;
   try {
     if (MODE === 'premium') {
       const c = new premium.PremiumClient(u, password);
@@ -848,6 +859,7 @@ app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
         return res.json({ success: false, error: 'not_premium' });
       }
       ok = acc.ok;
+      vipUntil = acc.validUntil || null;
       if (ok) premiumClients.set(`${u.toLowerCase()}:${auth.passwordFingerprint(password)}`, c);
     } else {
       const c = new TitulkyClient(u, password);
@@ -863,7 +875,7 @@ app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
 
   const cfg = { u, p: password, c: PROFILES.includes(client) ? client : 'auto' };
   if (typeof rdToken === 'string' && /^[A-Za-z0-9]{20,100}$/.test(rdToken.trim())) cfg.rd = rdToken.trim();
-  res.json({ success: true, config: auth.encryptConfig(cfg) });
+  res.json({ success: true, config: auth.encryptConfig(cfg), user: u, validUntil: vipUntil ? new Date(vipUntil).toISOString() : null });
 }));
 
 // ── Chyby a start ────────────────────────────────────────────────
