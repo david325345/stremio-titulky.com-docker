@@ -14,6 +14,10 @@ const match = require('./lib/matching');
 const conv = require('./lib/convert');
 const { detectProfile, noteManifest, listSeen, PROFILES } = require('./lib/clientDetect');
 const pages = require('./lib/pages');
+const premium = require('./lib/premium');
+
+// Zdroj titulků: premium.titulky.com (hledání podle IMDb, jen pro VIP) nebo původní www (classic)
+const MODE = process.env.TITULKY_MODE === 'classic' ? 'classic' : 'premium';
 
 auth.init();
 r2.loadCacheIndex();
@@ -21,7 +25,7 @@ r2.loadCacheIndex();
 const app = express();
 const PORT = process.env.PORT || 3007;
 const MAX_RESULTS = 10;
-const VERSION = '2.0.6';
+const VERSION = '2.1.0';
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -130,6 +134,18 @@ function getClient(config) {
   if (!c) {
     c = new TitulkyClient(config.u, config.p);
     clients.set(key, c);
+  }
+  return c;
+}
+
+const premiumClients = new finder.BoundedCache(500, 0);
+
+function getPremiumClient(config) {
+  const key = `${config.u.toLowerCase()}:${auth.passwordFingerprint(config.p)}`;
+  let c = premiumClients.get(key);
+  if (!c) {
+    c = new premium.PremiumClient(config.u, config.p);
+    premiumClients.set(key, c);
   }
   return c;
 }
@@ -310,6 +326,44 @@ function nuvioSkipFirst(req, configStr, videoId, extra) {
   return true;
 }
 
+// ── Premium: hledání podle IMDb ─────────────────────────────────
+
+const NOTICE_LABEL = {
+  premium: '⚠️ Addon teď vyžaduje premium.titulky.com (VIP)',
+  login: '⚠️ Přihlášení na premium.titulky.com selhalo',
+  error: '⚠️ premium.titulky.com teď neodpovídá',
+};
+const NOTICE_TEXT = {
+  premium: 'Addon teď hledá a stahuje titulky přes premium.titulky.com, který je jen pro účty s aktivním VIP (prémiovým) nebo překladatelským účtem. Váš účet ho nemá – aktivujte VIP na titulky.com a pak titulky naběhnou samy.',
+  login: 'Přihlášení na premium.titulky.com selhalo. Pokud jste změnili heslo, nainstalujte addon znovu přes stránku konfigurace.',
+  error: 'premium.titulky.com teď neodpovídá. Zkuste to prosím za chvíli.',
+};
+
+// { rows } nebo { notice: 'premium'|'login'|'error' }
+async function premiumRows(config, vid) {
+  const client = getPremiumClient(config);
+  try {
+    const acc = await client.checkAccount();
+    if (!acc.ok) return { notice: 'login' };
+    if (!acc.premium) return { notice: 'premium' };
+    return { rows: await premium.findSubs(client, vid.imdbId, vid.season, vid.episode) };
+  } catch (e) {
+    if (e.code === 'login' || e.code === 'premium') {
+      client.account = null;
+      console.log(`[Premium] ${config.u}: ${e.code}${e.message && e.message !== e.code ? ` („${e.message.slice(0, 100)}")` : ''}`);
+      return { notice: e.code };
+    }
+    console.log(`[Premium] Hledání ${vid.imdbId} selhalo: ${e.message}`);
+    return { notice: 'error' };
+  }
+}
+
+app.get('/notice/:code/:fmt/:file', (req, res) => {
+  const { code, fmt } = req.params;
+  const text = NOTICE_TEXT[code] || NOTICE_TEXT.error;
+  sendSubtitle(req, res, conv.messageSrt(text), 'titulky-info.srt', fmt === 'vtt' ? 'vtt' : 'srt', { error: true });
+});
+
 app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const config = getConfig(req);
   const { type } = req.params;
@@ -329,37 +383,68 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   // Nuvio pak odpověď z přehrávače (už s názvem souboru, s ⭐/🎯) nezahodí jako duplicitu.
   if (profile === 'nuvio' && nuvioSkipFirst(req, configStr, id, extra)) {
     console.log(`[Addon] ${type} ${id} | profil nuvio | první dotaz bez souboru → prázdný seznam (titulky pošlu přehrávači)`);
-    getMeta(type, vid.imdbId) // předehřát cache, ať je odpověď přehrávači rychlá
-      .then(m => m && finder.findCandidates({ type, meta: m, season: vid.season, episode: vid.episode }))
-      .catch(() => {});
+    if (MODE === 'premium') premiumRows(config, vid).catch(() => {}); // předehřát cache
+    else {
+      getMeta(type, vid.imdbId) // předehřát cache, ať je odpověď přehrávači rychlá
+        .then(m => m && finder.findCandidates({ type, meta: m, season: vid.season, episode: vid.episode }))
+        .catch(() => {});
+    }
     return res.json({ subtitles: [] });
   }
 
-  const meta = await getMeta(type, vid.imdbId);
-  if (!meta) return res.json({ subtitles: [] });
-  const name = meta.name || '';
+  let meta;
+  let candidates;
+  let notice = null;
+  if (MODE === 'premium') {
+    // Hledání podle IMDb na premium.titulky.com (Cinemeta jen pro název do historie)
+    const [m, pr] = await Promise.all([getMeta(type, vid.imdbId), premiumRows(config, vid)]);
+    meta = m || {};
+    candidates = pr.rows || [];
+    notice = pr.notice || null;
+  } else {
+    meta = await getMeta(type, vid.imdbId);
+    if (!meta) return res.json({ subtitles: [] });
+  }
+  const name = meta.name || candidates?.[0]?.title || '';
 
   // Název přehrávaného souboru (Stremio ho posílá v extra)
   let playing = (extra.get('filename') || '').trim();
-  if (!match.hasUsefulTags(match.extractTags(playing)) && config.rd) {
+  if (!notice && !match.hasUsefulTags(match.extractTags(playing)) && config.rd) {
     const fn = await rdFilename(config.rd, name, vid.season, vid.episode);
     if (fn) playing = fn;
   }
   const playTags = match.extractTags(playing);
 
-  // Hledání → řazení → ověření IMDb u nejlepších → přeřazení (s „Verze pro“ z detailu)
-  const candidates = await finder.findCandidates({ type, meta, season: vid.season, episode: vid.episode });
-  let rows = rankRows(candidates, playTags, ep);
-  rows = await finder.verifyCandidates(rows, vid.imdbId, MAX_RESULTS);
-  rows = rankRows(rows, playTags, ep);
+  let rows;
+  if (MODE === 'premium') {
+    // Hledáno přímo podle IMDb → bez kontroly IMDb, jen řazení
+    rows = rankRows(candidates, playTags, ep).slice(0, MAX_RESULTS);
+  } else {
+    // Hledání → řazení → ověření IMDb u nejlepších → přeřazení (s „Verze pro“ z detailu)
+    candidates = await finder.findCandidates({ type, meta, season: vid.season, episode: vid.episode });
+    rows = rankRows(candidates, playTags, ep);
+    rows = await finder.verifyCandidates(rows, vid.imdbId, MAX_RESULTS);
+    rows = rankRows(rows, playTags, ep);
+  }
 
-  console.log(`[Addon] ${type} ${id} "${name}" | profil ${profile} (${profileHow}) | soubor: ${playing ? 'ano' : 'ne'} | výsledků ${rows.length}/${candidates.length}`);
+  console.log(`[Addon] ${type} ${id} "${name}" | ${MODE} | profil ${profile} (${profileHow}) | soubor: ${playing ? 'ano' : 'ne'} | výsledků ${rows.length}/${candidates.length}${notice ? ` | upozornění: ${notice}` : ''}`);
 
   r2.addToHistory(config.u, { imdbId: vid.imdbId, type, id, name, poster: meta.poster || null, time: Date.now() });
 
   const fmt = profile === 'omni' ? 'vtt' : 'srt';
   const epTok = ep || '0';
   const omniCounters = {};
+
+  let noticeItem = null;
+  if (notice) {
+    // Jedna informační položka místo titulků (po kliknutí se zobrazí vysvětlení)
+    const url = `${host}/notice/${notice}/${fmt}/titulky-info.${fmt}`;
+    const text = NOTICE_LABEL[notice] || NOTICE_LABEL.error;
+    noticeItem = profile === 'omni' ? { id: `titulky-notice-${notice}`, url, lang: '⚠️', SubEncoding: 'UTF-8', SubFormat: 'vtt' }
+      : profile === 'nuvio' ? { id: fitNuvio(text), url, lang: 'cze', SubEncoding: 'UTF-8', SubFormat: 'srt' }
+        : { id: `titulky-notice-${notice}`, url, lang: text, SubEncoding: 'UTF-8', SubFormat: 'srt' };
+    rows = [];
+  }
 
   const subtitles = rows.map(row => {
     const icon = row.cached ? '✅' : '⬇️';
@@ -391,6 +476,8 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
       SubFormat: 'srt',
     };
   });
+
+  if (noticeItem) subtitles.unshift(noticeItem);
 
   // Vlastní (nahrané) titulky nahoru
   const customId = type === 'series' ? id.replace(/:/g, '-') : vid.imdbId;
@@ -428,8 +515,9 @@ const inflight = new Map();
 
 const ERROR_TEXT = {
   captcha: 'Titulky.com teď vyžaduje opsání kódu (captcha) – rychlá stažení na dnešek jsou nejspíš vyčerpaná. Zkuste titulky označené ✅ (jsou v cache) nebo to zkuste později.',
-  limit: 'Překročili jste denní limit stažení z Titulky.com. Zkuste titulky označené ✅ (jsou v cache) nebo počkejte do zítřka.',
+  limit: 'Vyčerpali jste denní limit stažení z Titulky.com. Počkejte do zítřka, nebo zatím použijte titulky označené ✅ – ty jsou v cache a stáhnou se vždy.',
   login: 'Přihlášení na Titulky.com selhalo. Nainstalujte addon znovu s aktuálním heslem.',
+  premium: 'Stahování přes premium.titulky.com je jen pro účty s aktivním VIP (prémiovým) nebo překladatelským účtem. Titulky označené ✅ jsou v cache a stáhnou se i tak.',
   error: 'Titulky se nepodařilo stáhnout (chyba na straně Titulky.com). Zkuste to prosím později.',
 };
 
@@ -438,8 +526,12 @@ function fileMatchesEpisode(filename, ep) {
   return !!e && match.episodeCode(e.season, e.episode) === ep;
 }
 
-async function fpsFor(subId, linkFile, text) {
+async function fpsFor(subId, linkFile, text, config) {
   if (conv.detectFormat(text) !== 'microdvd') return null;
+  if (MODE === 'premium' && config) {
+    const fps = await premium.fpsOf(getPremiumClient(config), subId);
+    if (fps) return fps;
+  }
   const d = await finder.getDetailById(subId, linkFile);
   return d?.fps || null;
 }
@@ -455,14 +547,15 @@ async function loadSubtitle(config, subId, linkFile, ep) {
     const o = await r2.getSub(k);
     if (o) {
       const text = conv.toUtf8String(Buffer.from(o.content, 'utf8'));
-      const out = { content: conv.toSrt(text, { fps: await fpsFor(subId, linkFile, text) }), filename: o.filename };
+      const out = { content: conv.toSrt(text, { fps: await fpsFor(subId, linkFile, text, config) }), filename: o.filename };
       subCache.set(k, out);
       return out;
     }
   }
 
-  const client = getClient(config);
-  const result = await client.download(subId, linkFile);
+  const result = MODE === 'premium'
+    ? await getPremiumClient(config).download(subId)
+    : await getClient(config).download(subId, linkFile);
   if (result.error) return { error: result.error };
 
   const files = result.files;
@@ -475,7 +568,7 @@ async function loadSubtitle(config, subId, linkFile, ep) {
   if (!pick) pick = files.find(f => /\.srt$/i.test(f.filename)) || files[0];
 
   const text = conv.toUtf8String(pick.content);
-  const srt = conv.toSrt(text, { fps: await fpsFor(subId, linkFile, text) });
+  const srt = conv.toSrt(text, { fps: await fpsFor(subId, linkFile, text, config) });
   const filename = pick.filename.replace(/\.[^.]+$/, '') + '.srt';
   const out = { content: srt, filename };
   subCache.set(cacheId, out);
@@ -747,14 +840,25 @@ app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
   const u = username.trim();
   let ok = false;
   try {
-    const c = new TitulkyClient(u, password);
-    ok = await c.login(true);
-    if (ok) clients.set(`${u.toLowerCase()}:${auth.passwordFingerprint(password)}`, c);
+    if (MODE === 'premium') {
+      const c = new premium.PremiumClient(u, password);
+      const acc = await c.checkAccount(true);
+      if (acc.ok && !acc.premium) {
+        console.log(`[Verify] ${u}: bez VIP`);
+        return res.json({ success: false, error: 'not_premium' });
+      }
+      ok = acc.ok;
+      if (ok) premiumClients.set(`${u.toLowerCase()}:${auth.passwordFingerprint(password)}`, c);
+    } else {
+      const c = new TitulkyClient(u, password);
+      ok = await c.login(true);
+      if (ok) clients.set(`${u.toLowerCase()}:${auth.passwordFingerprint(password)}`, c);
+    }
   } catch (e) {
     console.log(`[Verify] Chyba: ${e.message}`);
     return res.json({ success: false, error: 'server' });
   }
-  console.log(`[Verify] ${u}: ${ok ? 'OK' : 'špatné údaje'}`);
+  console.log(`[Verify] ${u}: ${ok ? 'OK' : 'špatné údaje'} (${MODE})`);
   if (!ok) return res.json({ success: false, error: 'bad_credentials' });
 
   const cfg = { u, p: password, c: PROFILES.includes(client) ? client : 'auto' };
