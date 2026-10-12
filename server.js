@@ -16,6 +16,7 @@ const { detectProfile, noteManifest, listSeen, PROFILES } = require('./lib/clien
 const pages = require('./lib/pages');
 const premium = require('./lib/premium');
 const catalog = require('./lib/catalog');
+const settings = require('./lib/settings');
 
 // Zdroj titulků: premium.titulky.com (hledání podle IMDb, jen pro VIP) nebo původní www (classic)
 const MODE = process.env.TITULKY_MODE === 'classic' ? 'classic' : 'premium';
@@ -218,7 +219,7 @@ app.get('/:config/configure', (req, res) => res.type('html').send(pages.configur
 // ── Manifest ─────────────────────────────────────────────────────
 
 const CATALOG_ID = 'titulky-nejnovejsi';
-const catalogOn = config => !!config && config.k !== 0; // starší instalace bez volby = zapnuto
+const catalogOn = config => !!config && settings.get(config.u, config).catalog; // uložené nastavení (starší config: k=0 = vypnuto)
 
 function manifest(configured, config = null) {
   const withCatalog = configured && catalogOn(config);
@@ -321,6 +322,7 @@ function rankRows(rows, playTags, ep) {
       b.level - a.level ||
       b.score - a.score ||
       b.quality - a.quality ||
+      (b.published === false ? 0 : 1) - (a.published === false ? 0 : 1) ||
       (b.downloads || 0) - (a.downloads || 0));
 }
 
@@ -398,7 +400,10 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   const vid = parseVideoId(type, id);
   if (!vid) return res.json({ subtitles: [] });
 
-  const { profile, how: profileHow } = detectProfile(req, config, req.params.config);
+  // Uživatelské nastavení (jazyky, nepublikované, přehrávač) – mění se na webu bez přeinstalace
+  const prefs = settings.get(config.u, config);
+  const { profile, how: profileHow } = detectProfile(req, { ...config, c: prefs.client }, req.params.config);
+  const allowed = row => prefs.langs.includes(normalizeLang(row.lang)) && (prefs.unpublished || row.published !== false);
   const host = hostOf(req);
   const configStr = req.params.config;
   const ep = type === 'series' ? match.episodeCode(vid.season, vid.episode) : null;
@@ -444,11 +449,11 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
   let rows;
   if (MODE === 'premium') {
     // Hledáno přímo podle IMDb → bez kontroly IMDb, jen řazení
-    rows = rankRows(candidates, playTags, ep).slice(0, MAX_RESULTS);
+    rows = rankRows(candidates.filter(allowed), playTags, ep).slice(0, MAX_RESULTS);
   } else {
     // Hledání → řazení → ověření IMDb u nejlepších → přeřazení (s „Verze pro“ z detailu)
     candidates = await finder.findCandidates({ type, meta, season: vid.season, episode: vid.episode });
-    rows = rankRows(candidates, playTags, ep);
+    rows = rankRows(candidates.filter(allowed), playTags, ep);
     rows = await finder.verifyCandidates(rows, vid.imdbId, MAX_RESULTS);
     rows = rankRows(rows, playTags, ep);
   }
@@ -474,14 +479,15 @@ app.get('/:config/subtitles/:type/:id/:extra?.json', ah(async (req, res) => {
 
   const subtitles = rows.map(row => {
     const icon = row.cached ? '✅' : '⬇️';
-    const star = row.level === 2 ? '🎯' : row.level === 1 ? '⭐' : '';
+    const match_ = row.level === 2 ? '🎯' : row.level === 1 ? '⭐' : '';
+    const star = [match_, row.published === false ? '⏳' : ''].filter(Boolean).join(' '); // ⏳ = čeká na schválení
     const label = cleanLabel(row.release || row.detail?.versionFor || row.title || '');
     const url = `${host}/sub/${configStr}/${row.id}/${fmt}/${epTok}/${encodeURIComponent(row.linkFile)}.${fmt}`;
     const lang = normalizeLang(row.lang);
 
     if (profile === 'omni') {
       const quality = match.qualityEmoji(label);
-      const group = `${icon}${star}${quality}`;
+      const group = `${icon}${star.replace(/ /g, '')}${quality}`;
       omniCounters[group] = (omniCounters[group] || 0) + 1;
       return { id: `titulky-${row.id}`, url, lang: `${group}${numberEmoji(omniCounters[group])}`, SubEncoding: 'UTF-8', SubFormat: 'vtt' };
     }
@@ -844,6 +850,34 @@ app.get('/:config/admin/clients', (req, res) => {
   res.json({ clients: listSeen() });
 });
 
+// ── Nastavení uživatele (web po přihlášení) ──────────────────────
+// Ověření = platný šifrovaný config (vydal ho server po přihlášení)
+const accountInfo = new Map(); // jméno → platnost VIP (pro zobrazení na webu)
+
+app.get('/:config/settings', ah(async (req, res) => {
+  const config = getConfig(req);
+  if (!config) return res.status(403).json({ success: false, error: 'config' });
+  let until = accountInfo.get(config.u.toLowerCase());
+  if (!until && MODE === 'premium') {
+    // Po restartu serveru: platnost VIP z účtu (přihlášení se drží v cache 6 h)
+    try {
+      const acc = await getPremiumClient(config).checkAccount();
+      if (acc.ok && acc.validUntil) { until = acc.validUntil; accountInfo.set(config.u.toLowerCase(), until); }
+    } catch { /* jen informace */ }
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ success: true, user: config.u, validUntil: until ? new Date(until).toISOString() : null, settings: settings.get(config.u, config) });
+}));
+
+app.post('/:config/settings', express.json({ limit: '4kb' }), (req, res) => {
+  const config = getConfig(req);
+  if (!config) return res.status(403).json({ success: false, error: 'config' });
+  const before = settings.get(config.u, config);
+  const saved = settings.save(config.u, req.body);
+  console.log(`[Nastavení] ${config.u}: jazyky ${saved.langs.join('+')}, nepublikované ${saved.unpublished ? 'ano' : 'ne'}, katalog ${saved.catalog ? 'ano' : 'ne'}, přehrávač ${saved.client}`);
+  res.json({ success: true, settings: saved, catalogChanged: before.catalog !== saved.catalog });
+});
+
 // ── Ověření přihlášení (vydává šifrovaný config) ─────────────────
 
 const verifyHits = new Map(); // IP → [časy]
@@ -858,7 +892,7 @@ function verifyRateLimited(ip) {
 
 app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
   if (verifyRateLimited(req.ip)) return res.status(429).json({ success: false, error: 'rate' });
-  const { username, password, client, rdToken, catalog: wantCatalog } = req.body || {};
+  const { username, password, client, rdToken } = req.body || {};
   if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password
       || username.length > 100 || password.length > 200) {
     return res.json({ success: false, error: 'missing_credentials' });
@@ -891,8 +925,8 @@ app.post('/verify', express.json({ limit: '10kb' }), ah(async (req, res) => {
 
   const cfg = { u, p: password, c: PROFILES.includes(client) ? client : 'auto' };
   if (typeof rdToken === 'string' && /^[A-Za-z0-9]{20,100}$/.test(rdToken.trim())) cfg.rd = rdToken.trim();
-  if (wantCatalog === false) cfg.k = 0;
-  res.json({ success: true, config: auth.encryptConfig(cfg), user: u, validUntil: vipUntil ? new Date(vipUntil).toISOString() : null });
+  if (vipUntil) accountInfo.set(u.toLowerCase(), vipUntil);
+  res.json({ success: true, config: auth.encryptConfig(cfg), user: u, validUntil: vipUntil ? new Date(vipUntil).toISOString() : null, settings: settings.get(u, cfg) });
 }));
 
 // ── Chyby a start ────────────────────────────────────────────────
@@ -906,15 +940,19 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
 
 process.on('unhandledRejection', e => console.error('[Chyba] Neošetřený promise:', e && e.message ? e.message : e));
 
-const server = app.listen(PORT, () => {
+let server;
+settings.load().catch(e => console.log(`[Nastavení] Načtení selhalo: ${e.message}`)).finally(() => {
+server = app.listen(PORT, () => {
   console.log(`Titulky.com addon ${VERSION} běží na portu ${PORT} – konfigurace: /configure`);
   catalog.start().catch(e => console.log(`[Katalog] Start selhal: ${e.message}`));
+});
 });
 
 async function shutdown(sig) {
   console.log(`[Stop] ${sig} – ukládám historii…`);
-  server.close();
+  if (server) server.close();
   try { await r2.flushAllHistory(); } catch { /* nic */ }
+  try { await settings.flush(); } catch { /* nic */ }
   process.exit(0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));

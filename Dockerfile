@@ -10,6 +10,10 @@ RUN NODE_OPTIONS="--max-old-space-size=512" npm ci --omit=dev \
 
 COPY . .
 
+# Trvalá data (nastavení uživatelů) – v Coolify namapovat Persistent Storage na /app/data
+RUN mkdir -p /app/data && chown -R node:node /app/data
+VOLUME /app/data
+
 # Neběžet jako root
 USER node
 
