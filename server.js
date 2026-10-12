@@ -253,7 +253,16 @@ app.get('/:config/catalog/:type/:id/:extra?.json', (req, res) => {
   const extra = new URLSearchParams(req.params.extra || '');
   const skip = parseInt(extra.get('skip') || '0', 10) || 0;
   res.setHeader('Cache-Control', 'public, max-age=1800');
-  res.json({ metas: skip > 0 ? [] : catalog.getMetas() });
+  res.json({ metas: skip > 0 ? [] : catalog.metasFor(hostOf(req)) });
+});
+
+// Plakáty katalogu uložené na disku
+app.get('/poster/:file', (req, res) => {
+  const m = String(req.params.file).match(/^(tt\d{5,10})\.jpg$/);
+  const f = m && catalog.posterPath(m[1]);
+  if (!f) return res.status(404).send('Nenalezeno');
+  res.setHeader('Cache-Control', 'public, max-age=604800');
+  res.type('jpg').sendFile(f);
 });
 
 // ── Hledání titulků ──────────────────────────────────────────────
