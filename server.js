@@ -229,7 +229,9 @@ function manifest(configured, config = null) {
     name: 'Titulky.com',
     description: 'České a slovenské titulky z Titulky.com',
     // Jeden katalog s filmy i seriály – každá položka má vlastní typ
-    catalogs: withCatalog ? [{ type: 'movie', id: CATALOG_ID, name: 'Nejnovější titulky' }] : [],
+    // jen stránkování, bez hledání (ať se katalog neplete do výsledků vyhledávání)
+    catalogs: withCatalog ? [{ type: 'movie', id: CATALOG_ID, name: 'Nejnovější titulky',
+      extra: [{ name: 'skip', isRequired: false }], extraSupported: ['skip'] }] : [],
     resources: withCatalog ? ['subtitles', 'catalog'] : ['subtitles'],
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
@@ -251,6 +253,8 @@ app.get('/:config/catalog/:type/:id/:extra?.json', (req, res) => {
   const config = getConfig(req);
   if (!config || !catalogOn(config) || req.params.id !== CATALOG_ID) return res.json({ metas: [] });
   const extra = new URLSearchParams(req.params.extra || '');
+  // Hledání katalog nepodporuje (Nuvio ho přesto posílá) → prázdný výsledek
+  if (extra.has('search') || extra.has('genre')) return res.json({ metas: [] });
   const skip = parseInt(extra.get('skip') || '0', 10) || 0;
   res.setHeader('Cache-Control', 'public, max-age=1800');
   res.json({ metas: skip > 0 ? [] : catalog.metasFor(hostOf(req)) });
